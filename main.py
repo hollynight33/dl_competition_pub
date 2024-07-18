@@ -60,6 +60,36 @@ def process_text(text):
 
     return text
 
+# # Cutout data augmentation
+def cutout(img: torch.Tensor, n_holes: int = 1, length: int = 16) -> torch.Tensor:
+    h = img.size(1)
+    w = img.size(2)
+    mask = np.ones((h, w), np.float32)
+    for n in range(n_holes):
+        y = np.random.randint(h)
+        x = np.random.randint(w)
+        y1 = np.clip(y - length // 2, 0, h)
+        y2 = np.clip(y + length // 2, 0, h)
+        x1 = np.clip(x - length // 2, 0, w)
+        x2 = np.clip(x + length // 2, 0, w)
+        mask[y1: y2, x1: x2] = 0.
+    mask = torch.from_numpy(mask)
+    mask = mask.repeat(img.size(0), 1, 1)
+    img = img * mask
+    return img
+
+# Mixup data augmentation.
+def mixup_data(x: torch.Tensor, y: torch.Tensor, alpha: float = 1.0) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+
+    batch_size = x.size()[0]
+    index = torch.randperm(batch_size)
+
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    return mixed_x, y, y[index], lam
 
 # 1. データローダーの作成
 class VQADataset(torch.utils.data.Dataset):
@@ -171,7 +201,7 @@ def VQA_criterion(batch_pred: torch.Tensor, batch_answers: torch.Tensor):
     return total_acc / len(batch_pred)
 
 
-# 3. モデルのの実装
+# 3. モデルの実装
 # ResNetを利用できるようにしておく
 class BasicBlock(nn.Module):
     expansion = 1
@@ -291,10 +321,17 @@ class VQAModel(nn.Module):
     def __init__(self, vocab_size: int, n_answer: int):
         super().__init__()
         self.resnet = ResNet18()
-        self.text_encoder = nn.Linear(vocab_size, 512)
+        self.text_encoder = nn.Sequential(
+            nn.Linear(vocab_size, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.5),
+        )
 
         self.fc = nn.Sequential(
             nn.Linear(1024, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.5),
+            nn.Linear(512, 512),
             nn.ReLU(inplace=True),
             nn.Linear(512, n_answer)
         )
@@ -322,8 +359,20 @@ def train(model, dataloader, optimizer, criterion, device):
         image, question, answer, mode_answer = \
             image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
 
-        pred = model(image, question)
-        loss = criterion(pred, mode_answer.squeeze())
+        # # Cutout
+        # if np.random.rand() < 0.5:
+        #     image = cutout(image[0], 1, 16).unsqueeze(0)
+
+        # Mixup
+        image, mode_answer_a, mode_answer_b, lam = mixup_data(image, mode_answer, 1.0)
+
+        pred = model(image, question).to(device)
+
+        # Mixup適用時のloss計算
+        if isinstance(mode_answer, torch.Tensor): 
+            loss = criterion(pred, mode_answer.squeeze())
+        else:  
+            loss = lam * criterion(pred, mode_answer_a.squeeze()) + (1 - lam) * criterion(pred, mode_answer_b.squeeze())
 
         optimizer.zero_grad()
         loss.backward()
@@ -353,7 +402,8 @@ def eval(model, dataloader, optimizer, criterion, device):
 
         total_loss += loss.item()
         total_acc += VQA_criterion(pred.argmax(1), answers)  # VQA accuracy
-        simple_acc += (pred.argmax(1) == mode_answer).mean().item()  # simple accuracy
+        if isinstance(mode_answer, torch.Tensor):
+            simple_acc += (pred.argmax(1) == mode_answer).float().mean().item()   # simple accuracy
 
     return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
 
@@ -361,7 +411,7 @@ def eval(model, dataloader, optimizer, criterion, device):
 def main():
     # deviceの設定
     set_seed(42)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # dataloader / model
     transform = transforms.Compose([
